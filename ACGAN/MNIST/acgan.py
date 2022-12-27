@@ -1,22 +1,27 @@
-import os
-import pickle as pkl
+import PIL.Image as Image
+from ignite.engine import Engine
+from ignite.metrics import FID, InceptionScore
+from torchvision import datasets, transforms
+import copy
 import threading
 import time
 from queue import Queue
+from time import sleep
 from random import Random
-
+import pandas as pd
+from matplotlib import pyplot as plt
 import numpy as np
 import torch
-from matplotlib import pyplot as plt
 from torch import nn, optim
-from torch.autograd import Variable
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 from torchvision import datasets as torch_ds
+from torch.utils.data import DataLoader
+import os
 from torchvision.utils import save_image
 from tqdm import tqdm
-
+import torch.nn.functional as F
 from mnist_model import Discriminator, Generator
+from torch.autograd import Variable
+import pickle as pkl
 
 Tensor = torch.cuda.FloatTensor if torch.cuda.device_count() else torch.FloatTensor
 
@@ -43,12 +48,10 @@ torch.cuda.manual_seed(20211212)
 datasets = []
 test_set = []
 input_size = None
-# service_size = [3, 3]  # 每个服务器的服务对象数, 有一个处于overlap位置
-overlap = num_servers / num_workers  # 设备处于overlap区域的概率
 batch_size = 100
 frac_workers = 1     # 选择同步的工人的比例 （默认为全部）
 epoch = 1            # 同步前的本地迭代次数
-# overlap_worker = [[0], [0]]
+
 ims = 0
 b1 = 0.5
 b2 = 0.999
@@ -59,13 +62,17 @@ dataset = None
 
 
 def plot_2d():
+
     for item in tqdm(range(num_communication//500)):
         D = []
         for j in range(num_servers):
             X = servers[j].queen_gen_data.get()
             D.append(X)
+
         D = torch.cat(D)
         save_image(D[::D.shape[0] // 100], "./logger/" + SimulationName + "/%d.png" % item, nrow=10, normalize=True)
+
+
 
 
 class Server(threading.Thread):
@@ -166,7 +173,8 @@ class Server(threading.Thread):
         losses = loss.mean()
         losses.backward()
         opti.step()
-
+        with lock:
+            print(self.name, losses.item())
         end = time.time()
         return losses.item()
 
@@ -219,7 +227,7 @@ class Worker(threading.Thread):
 
         t = num_communication
         net_d = Discriminator(ims).cuda()
-        loss = nn.BCELoss().cuda()
+        loss = nn.CrossEntropyLoss().cuda()
         opti_d = optim.Adam(net_d.parameters(), lr=self.lr_d, betas=(b1, b2))
         s = {}
         w = {}
@@ -269,23 +277,27 @@ class Worker(threading.Thread):
                 except StopIteration:
                     self.data = iter(self.dataloader)
                     imgs = next(self.data)
-                valid = Variable(Tensor(imgs.shape[0], 1).fill_(1), requires_grad=False)
+                # valid = Variable(Tensor(imgs.shape[0], 1).fill_(1), requires_grad=False)
+                valid = Variable(torch.cuda.LongTensor(imgs.shape[0]).fill_(1), requires_grad=False)
                 real_imgs = Variable(imgs.type(Tensor))
                 opti_d.zero_grad()
                 real_loss = loss(net_d(real_imgs), valid)
 
-                fake = Variable(Tensor(self.batch_size, 1).fill_(0), requires_grad=False)
-
+                # fake = Variable(Tensor(self.batch_size, 1).fill_(0), requires_grad=False)
+                fake = Variable(torch.cuda.LongTensor(self.batch_size).fill_(0),
+                                                requires_grad=False)
                 fake_loss = loss(net_d(X), fake)
                 D_loss = (real_loss + fake_loss)
                 D_loss.backward()
                 opti_d.step()
-        valid = Variable(Tensor(self.batch_size, 1).fill_(1), requires_grad=False)
+        # valid = Variable(Tensor(self.batch_size, 1).fill_(1), requires_grad=False)
+        valid = Variable(torch.cuda.LongTensor(self.batch_size).fill_(1), requires_grad=False)
         for _ in self.server_list:
             (id, Xg) = self.queen_g.get()
             validaty = net_d(Xg)
             G_loss = loss(validaty, valid)
             servers[id].queen_g.put((self.idx, G_loss))
+
         end = time.time()
 
 def del_tensor_ele(arr, index, l):
@@ -393,33 +405,18 @@ if __name__ == "__main__":
                 save_image(datasets[i][rd.sample(range(len(datasets[i])), 100)],
                            "./logger/" + SimulationName + "/device_%d.png" % i, nrow=10,
                            normalize=True)
+
             for i in range(num_servers):
                 servers.append(Server(i))
 
             # 获取每个设备处于overlap的概率
             worker = [id for id in range(num_workers)]
-            # for i in range(num_servers):
-            #     alnwokers = worker[:num_workers // num_servers]
-            #     worker = worker[num_workers // num_servers:]
-            #     for j in alnwokers:
-            #         servers[i].client_list.append(j)
-            #         workers[j].server_list.append(i)
-            rnd = rd.sample(worker, k=int(overlap * num_workers))
-            for w in rnd:
-                worker.remove(w)
             for i in range(num_servers):
-                alnwokers = worker[:int(num_workers * (1 - overlap)) // num_servers]
-                worker = worker[int(num_workers * (1 - overlap)) // num_servers:]
+                alnwokers = worker[:num_workers // num_servers]
+                worker = worker[num_workers // num_servers:]
                 for j in alnwokers:
                     servers[i].client_list.append(j)
                     workers[j].server_list.append(i)
-                ovewokers = rnd[:int(num_workers * overlap) // num_servers]
-                rnd = rnd[int(num_workers * overlap) // num_servers:]
-                for j in ovewokers:
-                    servers[i].client_list.append(j)
-                    workers[j].server_list.append(i)
-                    servers[(i + 1) % num_servers].client_list.append(j)
-                    workers[j].server_list.append((i + 1) % num_servers)
 
             print("Simulation", SimulationName, " is started!!!")
             # 启动所有程序

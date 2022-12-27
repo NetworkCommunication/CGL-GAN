@@ -23,8 +23,6 @@ from tqdm import tqdm
 from mnist_model import Discriminator, Generator
 
 Tensor = torch.cuda.FloatTensor if torch.cuda.device_count() else torch.FloatTensor
-
-
 plt.ion()
 lock = threading.Lock()
 SimulationName = None
@@ -249,32 +247,26 @@ class Worker(threading.Thread):
         fake = Variable(Tensor(self.batch_size, 1).fill_(0), requires_grad=False)
 
         for i in range(epoch):
-            try:
-                imgs = next(self.data)
-            except StopIteration:
-                self.dataloader = DataLoader(dataset=self.dataset, batch_size=self.batch_size, shuffle=True)
-                self.data = iter(self.dataloader)
-                imgs = next(self.data)
+            for i, imgs in enumerate(DataLoader(dataset=self.dataset, batch_size=self.batch_size)):
+                z = Variable(Tensor(np.random.normal(0, 1, (self.batch_size, 100))))
+                Xd = net_g(z)
+                real_imgs = Variable(imgs.type(Tensor))
 
-            z = Variable(Tensor(np.random.normal(0, 1, (self.batch_size, 100))))
-            Xd = net_g(z)
-            real_imgs = Variable(imgs.type(Tensor))
+                valid = Variable(Tensor(imgs.shape[0], 1).fill_(1), requires_grad=False)
+                opti_d.zero_grad()
+                real_loss = loss(net_d(real_imgs), valid)
+                fake_loss = loss(net_d(Xd), fake)
+                D_loss = (real_loss + fake_loss)
+                D_loss.backward()
+                opti_d.step()
 
-            valid = Variable(Tensor(imgs.shape[0], 1).fill_(1), requires_grad=False)
-            opti_d.zero_grad()
-            real_loss = loss(net_d(real_imgs), valid)
-            fake_loss = loss(net_d(Xd), fake)
-            D_loss = (real_loss + fake_loss)
-            D_loss.backward()
-            opti_d.step()
-
-            valid = Variable(Tensor(self.batch_size, 1).fill_(1), requires_grad=False)
-            opti_g.zero_grad()
-            z = Variable(Tensor(np.random.normal(0, 1, (self.batch_size, 100))))
-            Xg = net_g(z)
-            g_loss = loss(net_d(Xg), valid)
-            g_loss.backward()
-            opti_g.step()
+                valid = Variable(Tensor(self.batch_size, 1).fill_(1), requires_grad=False)
+                opti_g.zero_grad()
+                z = Variable(Tensor(np.random.normal(0, 1, (self.batch_size, 100))))
+                Xg = net_g(z)
+                g_loss = loss(net_d(Xg), valid)
+                g_loss.backward()
+                opti_g.step()
         end = time.time()
 
 
@@ -364,7 +356,7 @@ if __name__ == "__main__":
                                               transforms.ToTensor(),
                                               transforms.Normalize([0.5], [0.5])
                                               ]))
-            for k in range(3):
+            for k in range(1, 3):
                 workers.clear()
                 datasets.clear()
                 iid = k

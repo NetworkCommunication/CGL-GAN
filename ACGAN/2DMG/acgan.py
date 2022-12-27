@@ -1,23 +1,23 @@
 import copy
-import os
 import threading
 import time
 from queue import Queue
+from time import sleep
 from random import Random
 
-import numpy as np
 import pandas as pd
-import torch
 from matplotlib import pyplot as plt
-from scipy.stats import entropy
+import numpy as np
+import torch
 from torch import nn, optim
-from torch.autograd import Variable
 from torch.utils.data import DataLoader
+import os
+from torchvision.utils import save_image
 from tqdm import tqdm
-
-from data import gmm
+from scipy.stats import entropy
 from model import Discriminator, Generator
-
+from data import gmm
+from torch.autograd import Variable
 Tensor = torch.cuda.FloatTensor if torch.cuda.device_count() else torch.FloatTensor
 
 
@@ -85,13 +85,18 @@ def plot_2d():
         r_h_zero = np.array(r_h_zero)
         g_h_zero = np.array(g_h_zero)
         kl_score = entropy(g_h_zero, r_h_zero)
+        ds = g_h_zero.sum() / len(D)
+        # cs = np.array(g_h_zero).nonzero()[0].size / r_h_zero.size
+        record["Distribution Score"] = ds.item()
+        # record["Mixture Guass Score"] = cs * ds
         record["KL Score"] = kl_score
+        # plt.title("Round:{}".format(item + 1))
         plt.savefig("./logger/" + SimulationName + "/" + "%d.png" % (item + 1))
         plt.cla()
         df = df.append(record, ignore_index=True)
         df.to_excel("./logger/" + SimulationName + ".xlsx")
         with lock:
-            print("kl", kl_score)
+            print("ds", ds.item(), "kl", kl_score)
 
 
 class Server(threading.Thread):

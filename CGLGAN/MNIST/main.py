@@ -1,11 +1,12 @@
 import copy
+import math
 import os
 import pickle as pkl
 import threading
 import time
 from queue import Queue
 from random import Random
-
+import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -17,10 +18,13 @@ from torchvision import datasets, transforms
 from torchvision import datasets as torch_ds
 from torchvision.utils import save_image
 from tqdm import tqdm
-
+from copy import deepcopy
 from mnist_model import Discriminator, Generator
 
 Tensor = torch.cuda.FloatTensor if torch.cuda.device_count() else torch.FloatTensor
+
+parser = argparse.ArgumentParser()
+parser.add_argument("-s", "--setting", default=0, type=int)
 
 
 plt.ion()
@@ -33,7 +37,7 @@ cloud = None
 cloud_epoch = 1
 segema = 0
 # server_epoch = 100
-num_workers = 10
+num_workers = 20
 num_servers = 5
 num_class = 10        # 需要大于等于 num_worker
 num_sample = 1000    # 每个类别的样本数量
@@ -55,7 +59,7 @@ ims = 0
 b1 = 0.5
 b2 = 0.999
 img_size = 28
-
+linear_average = True
 
 dataset = None
 
@@ -165,8 +169,6 @@ class Server(threading.Thread):
         # segema = torch.tensor(0)  # 1 是完全独立学习 0 是完全共享学习
         lambda_list = []
         gen_data = []
-        betas = []
-        gammas = []
         while t > 0:
 
             if t % 500 == 0:
@@ -181,16 +183,14 @@ class Server(threading.Thread):
                     recv_p[key] = segema * self_p[key] + (1 - segema) * recv_p[key]
                 net_g.load_state_dict(recv_p, strict=False)
 
-            fbeta, fgamma = self.train(net_g, opti_g, N)
+            self.train(net_g, opti_g, N)
             if t % 500 == 0:
-                betas.append(fbeta)
-                gammas.append(fgamma)
                 lambda_list.append(self.Lambda.item())
             torch.cuda.empty_cache()
             t -= 1
         torch.save(net_g.state_dict(), "./logger/"+SimulationName + "/{}.pt".format(self.name))
         with open("./logger/" + SimulationName + "/config{}.pkl".format(self.name), 'wb') as f:  # 将数据写入pkl文件
-             pkl.dump((self.client_list, self.beta, lambda_list, [], gen_data, betas, gammas), f)
+             pkl.dump((self.client_list, self.beta, lambda_list, [], gen_data), f)
 
     def plot_2d(self, net):
         net.eval()
@@ -203,58 +203,98 @@ class Server(threading.Thread):
     def train(self, net_g, opti, N):
         start = time.time()
 
-        # 生成随机噪音，使用正态分布
-        with torch.no_grad():
-            z = torch.randn(self.batch_size, 100, device="cuda:0", requires_grad=True)
-            Xd = torch.chunk(net_g(z), len(self.client_list), dim=0) if iid != 0 else net_g(z)
+        if iid == 0:
 
-        z = torch.randn(self.batch_size, 100, device="cuda:0", requires_grad=True)
-        Xg = torch.chunk(net_g(z), len(self.client_list), dim=0) if iid != 0 else net_g(z)
+            m = max(int(math.log2(N)), 1)
 
-        # send
-        for client in self.client_list:
-            if iid != 0:
-                workers[client].queen_d.put((self.idx, Xd[self.client_list.index(client)].clone()))
-                workers[client].queen_g.put((self.idx, Xg[self.client_list.index(client)].clone()))
+            z = torch.randn(self.batch_size*m, 100, device="cuda:0", requires_grad=True)
+            Xs = torch.chunk(net_g(z), m, dim=0)
+
+            # send
+            for i, client in enumerate(self.client_list):
+                workers[client].queen_g.put((self.idx, deepcopy(Xs[(i % m) + 1].detach().cpu())))
+                workers[client].queen_d.put((self.idx, deepcopy(Xs[((i + 1) % m) + 1].detach().cpu())))
+
+            opti.zero_grad()
+            Feeds = []
+            for i in range(N):
+                (idx, F_grad, F_pred) = self.queen_g.get()
+                Feeds.append((self.client_list.index(idx), F_grad, F_pred))
+
+            sorted(Feeds, key=lambda x, y: x[0] < y[0])
+            preds = torch.tensor([F_pred for (_, _, F_pred) in Feeds])
+
+            gamma = F.softmax(self.Lambda * preds, dim=0).detach()
+            s = self.beta * gamma
+            if linear_average:
+                s = s / s.sum()
             else:
-                workers[client].queen_d.put((self.idx, Xd.clone()))
-                workers[client].queen_g.put((self.idx, Xg.clone()))
+                s = F.softmax(s, dim=0)
 
-        opti.zero_grad()
-        loss = torch.zeros(N)
+            for (i, (_, F_grad, _)) in enumerate(Feeds):
+                Xs[i % m + 1].backward(gradient=s[i] * F_grad, retain_graph=True)
 
-        for i in range(N):
-            (idx, g_loss) = self.queen_g.get()
-            # 更新个性层
-            loss[self.client_list.index(idx)] = g_loss.clone()
-        self.opti_L.zero_grad()
-        Lambda = self.Lambda
-        if iid != 0:
-            losses = loss.sum()
-            net_g.model.requires_grad_(False)
-            losses.backward(retain_graph=True)
-            net_g.model.requires_grad_(True)
+            opti.step()
 
-        # 计算权重和并更新神经网络
-        gamma = F.softmax(Lambda * loss, dim=0).detach()
-        F_beta = (self.beta * loss).sum()
-        F_gamma = (gamma * loss).sum()
-        F_max = (F_beta + F_gamma) / 2
+            gamma = F.softmax(self.Lambda * preds, dim=0)
+            v_lambda = (gamma * preds).sum()
+            loss = 1 / v_lambda
+            loss.backward()
+            self.opti_L.step()
 
-        if iid != 0:
-            net_g.paths.requires_grad_(False)
-            F_max.backward()
-            net_g.paths.requires_grad_(True)
         else:
-            F_max.backward()
-        # 计算梯度并更新lambda
-        grad = (loss * loss * gamma).sum() - (loss * gamma * F_gamma).sum()
-        self.Lambda = Lambda + 10 * grad
-        # with lock: print(self.name, "F_max:", F_max.item())
-        opti.step()
-        # self.opti_L.step()
-        end = time.time()
-        return F_beta.item(), F_gamma.item()
+            # 生成随机噪音，使用正态分布
+            with torch.no_grad():
+                z = torch.randn(self.batch_size, 100, device="cuda:0", requires_grad=True)
+                Xd = torch.chunk(net_g(z), len(self.client_list), dim=0) if iid != 0 else net_g(z)
+
+            z = torch.randn(self.batch_size, 100, device="cuda:0", requires_grad=True)
+            Xg = torch.chunk(net_g(z), len(self.client_list), dim=0) if iid != 0 else net_g(z)
+
+            # send
+            for client in self.client_list:
+                if iid != 0:
+                    workers[client].queen_d.put((self.idx, Xd[self.client_list.index(client)].clone()))
+                    workers[client].queen_g.put((self.idx, Xg[self.client_list.index(client)].clone()))
+                else:
+                    workers[client].queen_d.put((self.idx, Xd.clone()))
+                    workers[client].queen_g.put((self.idx, Xg.clone()))
+
+            opti.zero_grad()
+            loss = torch.zeros(N)
+
+            for i in range(N):
+                (idx, g_loss) = self.queen_g.get()
+                # 更新个性层
+                loss[self.client_list.index(idx)] = g_loss.clone()
+            self.opti_L.zero_grad()
+            Lambda = self.Lambda
+            if iid != 0:
+                losses = loss.sum()
+                net_g.model.requires_grad_(False)
+                losses.backward(retain_graph=True)
+                net_g.model.requires_grad_(True)
+
+            # 计算权重和并更新神经网络
+            gamma = F.softmax(Lambda * loss, dim=0).detach()
+            F_beta = (self.beta * loss).sum()
+            F_gamma = (gamma * loss).sum()
+            F_max = (F_beta + F_gamma) / 2
+
+            if iid != 0:
+                net_g.paths.requires_grad_(False)
+                F_max.backward()
+                net_g.paths.requires_grad_(True)
+            else:
+                F_max.backward()
+            # 计算梯度并更新lambda
+            grad = (loss * loss * gamma).sum() - (loss * gamma * F_gamma).sum()
+            self.Lambda = Lambda + 10 * grad
+            # with lock: print(self.name, "F_max:", F_max.item())
+            opti.step()
+            # self.opti_L.step()
+            end = time.time()
+
 
 
 
@@ -323,8 +363,8 @@ class Worker(threading.Thread):
     def train(self, net_d, loss, opti_d, N):
         start = time.time()
         Xs = []
-        for _ in self.server_list:
-            Xs.append(self.queen_d.get())
+
+        idx, Xd = self.queen_d.get()
         for i in range(epoch):
             try:
                 imgs = next(self.data)
